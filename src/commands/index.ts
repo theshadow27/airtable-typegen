@@ -3,17 +3,18 @@ import { paramCase, pascalCase } from 'change-case'
 import * as dotenv from 'dotenv'
 import fs from 'fs-extra'
 import path from 'node:path'
+import z from 'zod'
 
-import { BaseListMetadataSchema, BaseMetadata, TableListMetadataSchema, TableMetadata } from '../schemas/api'
-import { AIRTABLE_API_BASE, AIRTABLE_API_BASE_META_PATH, AIRTABLE_API_VERSION } from '../utils/constants'
 import {
-  AttachmentTsTmpl,
-  AttachmentZodTmpl,
-  CollaboratorTsTmpl,
-  CollaboratorZodTmpl,
-  getTsType,
-  getZodType,
-} from '../utils/field-mappings'
+  BaseListMetadata,
+  BaseListMetadataSchema,
+  BaseMetadata,
+  TableListMetadata,
+  TableListMetadataSchema,
+  TableMetadata,
+} from '../schemas/api'
+import { AIRTABLE_API_BASE, AIRTABLE_API_BASE_META_PATH, AIRTABLE_API_VERSION } from '../utils/constants'
+import { AttachmentZodTmpl, CollaboratorZodTmpl, getTsType, getZodType, tsExtras } from '../utils/field-mappings'
 import { getFieldEnumName, hasAttachmentField, hasCollaboratorField, isReadonlyField } from '../utils/helpers'
 import httpRequest from '../utils/http-request'
 
@@ -37,6 +38,12 @@ Reads environment from .env file if present in current working directory.`
 
   static flags = {
     version: Flags.version({ char: 'v' }),
+    jsoncache: Flags.string({
+      char: 's',
+      description:
+        'Specify a JSON file to use (instead of fetching from Airtable). If it does not exist, we will write it.',
+      required: false,
+    }),
     output: Flags.string({
       char: 'o',
       description: 'The file (relative to CWD) to write generated code to (defaults to "base-name.ts")',
@@ -52,6 +59,17 @@ Reads environment from .env file if present in current working directory.`
       description: 'A comma-separated list of tables (names or ids) to generate from (defaults to all tables)',
       required: false,
     }),
+    id: Flags.boolean({
+      description: 'Use this key as the strongly typed IDs within the generated code (TypeScript only) reverse with --no-id',
+      required: false,
+      default: true,
+    }),
+    controllers: Flags.boolean({
+      char: 'c',
+      description: 'Generate controllers for each table (TypeScript only)',
+      required: false,
+      default: false,
+    }),
   }
 
   static args = [
@@ -64,8 +82,23 @@ Reads environment from .env file if present in current working directory.`
 
   private accessToken = process.env.AIRTABLE_TYPEGEN_ACCESS_TOKEN
   private baseId: string | undefined
+  private flags: {
+    version: void
+    zod?: boolean
+    tables?: string
+    addid?: string
+    addcontrollers?: boolean
+    jsoncache?: string
+    [flag: string]: any
+  } = {
+    version: undefined,
+  }
+  private baseMetadata: BaseListMetadata | undefined
+  private tableMetadata: TableListMetadata | undefined
+  private shouldWriteJson = false
 
   private async fetchAirtableApi<T>(reqPath: string): Promise<T> {
+    this.log(`Fetching ${reqPath}`)
     if (!this.accessToken) {
       this.error(
         'No Airtable Access Token token provided. Make sure to set the AIRTABLE_TYPEGEN_ACCESS_TOKEN environment variable.',
@@ -87,8 +120,14 @@ Reads environment from .env file if present in current working directory.`
   async run(): Promise<void> {
     const { args, flags } = await this.parse(Main)
     this.baseId = args[ARG_NAME]
+    this.flags = flags
 
-    this.log('Fetching Airtable metadata')
+    if (flags.jsoncache && (await this.tryReadJsonCache(flags.jsoncache))) {
+      this.log('Using cached Airtable metadata')
+    } else {
+      this.log('Fetching Airtable metadata')
+    }
+
     const baseMeta = await this.getBaseMetadata()
     const tableMeta = await this.getTableMetadata(flags.tables?.split(','))
 
@@ -105,15 +144,52 @@ Reads environment from .env file if present in current working directory.`
     const output = path.resolve(process.cwd(), filepath)
     await fs.ensureFile(output)
     await fs.writeFile(output, data)
+
+    if (flags.jsoncache && this.shouldWriteJson) {
+      const json = {
+        baseMetadata: this.baseMetadata,
+        tableMetadata: this.tableMetadata,
+      }
+      const sfile = path.resolve(process.cwd(), flags.jsoncache)
+      await fs.ensureFile(sfile)
+      await fs.writeJSON(sfile, json, { spaces: 2 })
+    }
     this.log('Done!')
   }
 
+  private async tryReadJsonCache(file: string): Promise<boolean> {
+    const input = path.resolve(process.cwd(), file)
+    const exists = await fs.pathExists(input)
+
+    if (exists) {
+      try {
+        const json = await fs.readJSON(input)
+        if (json && json.baseMetadata && json.tableMetadata) {
+          this.baseMetadata = json.baseMetadata
+          this.tableMetadata = json.tableMetadata
+          return true
+        }
+      } catch (e) {
+        if (e instanceof z.ZodError) this.log('Error parsing schema file: ' + input, e.errors)
+        else this.log('Error reading schema file: ' + input, e)
+      }
+    } else {
+      this.log('Schema file does not exist yet: ' + input)
+    }
+
+    this.shouldWriteJson = true
+    this.baseMetadata = undefined
+    this.tableMetadata = undefined
+    return false
+  }
   /**
    * @param allowlist A list of table names or IDs to filter for
    * @returns Metadata for all (or allowlisted) tables in the specified base
    */
   private async getTableMetadata(allowlist?: string[]): Promise<TableMetadata[]> {
-    const res = await this.fetchAirtableApi(`${AIRTABLE_API_BASE_META_PATH}/${this.baseId}/tables`)
+    const res =
+      this.tableMetadata ??
+      (this.tableMetadata = await this.fetchAirtableApi(`${AIRTABLE_API_BASE_META_PATH}/${this.baseId}/tables`))
     const metadata = TableListMetadataSchema.parse(res)
 
     if (!allowlist) return metadata.tables
@@ -140,8 +216,9 @@ Reads environment from .env file if present in current working directory.`
    * @returns Metadata for the specified base
    */
   private async getBaseMetadata() {
-    const res = await this.fetchAirtableApi(AIRTABLE_API_BASE_META_PATH)
+    const res = this.baseMetadata ?? (this.baseMetadata = await this.fetchAirtableApi(AIRTABLE_API_BASE_META_PATH))
     const metadata = BaseListMetadataSchema.parse(res)
+
     const baseMeta = metadata.bases.find((b) => b.id === this.baseId)
     if (!baseMeta) {
       this.error(`Could not find base with ID ${this.baseId}`, {
@@ -204,33 +281,75 @@ Reads environment from .env file if present in current working directory.`
   }
 
   private async generateTSDefinitions(base: BaseMetadata, tables: TableMetadata[]) {
+    const controllers = !!this.flags.controllers
+    const genIds = !!this.flags.id
+
+    const tsOpts = { useAirtableLibraryTypes: controllers }
+
     const lines: string[] = []
 
     const allFields = tables.map((t) => t.fields).flat()
-    if (hasAttachmentField(allFields)) {
-      lines.push(AttachmentTsTmpl)
-      lines.push('')
+
+    if (controllers) {
+      lines.push(`import Airtable from 'airtable';`)
+    } else {
+      if (hasAttachmentField(allFields)) lines.push(tsExtras.getAdditionalTsForAttachments(), '')
+      if (hasCollaboratorField(allFields)) lines.push(tsExtras.getAdditionalTsForCollaborators(), '')
     }
-    if (hasCollaboratorField(allFields)) {
-      lines.push(CollaboratorTsTmpl)
-      lines.push('')
-    }
+
+    lines.push(`export type AirTableUid = string;`)
+
+    //if (genIds === 'Symbol') {
+    //  genIds = `[$id]`
+    //  lines.push(`export const $id = Symbol('__airtable_id__');`)
+    //}
 
     for (const table of tables) {
       const tableName = pascalCase(table.name)
-      lines.push(`export interface ${tableName} {`)
+      lines.push('', `export type ${tableName}Id = AirTableUid;`, '')
+      lines.push(`export interface ${tableName}${controllers ? ' extends Airtable.FieldSet' : ''} {`)
+      lines.push(`  _id: ${tableName}Id; // not respected by the official Airtable Library`)
+      // add the ID symbol when needed
+      //if (genIds) lines.push(`  ${genIds}: ${tableName}Id;`)
 
       for (const field of table.fields) {
         const fieldName = field.name
-        const fieldType = getTsType(field)
+        let fieldType = getTsType(field, tsOpts)
+
+        if (genIds && field.type === 'multipleRecordLinks') {
+          let linkedTableIdType = tables
+            .filter((t) => t.id == field.options.linkedTableId)
+            .map((t) => pascalCase(t.name) + 'Id')
+            .pop()
+          if (!linkedTableIdType) linkedTableIdType = 'AirTableUid' // ? Not found?
+          fieldType = `Array<${linkedTableIdType}>`
+        }
+
         // NOTE: Airtable API will NOT return a field if it's blank
         // so almost everything has to be marked optional unfortunately
         const isReadonly = isReadonlyField(field)
         lines.push(`  '${fieldName}'${isReadonly ? '' : '?'}: ${fieldType}`)
       }
 
-      lines.push('}')
-      lines.push('')
+      lines.push('}', '')
+    }
+
+    if (controllers) {
+      const baseName = pascalCase(base.name)
+      const className = `${baseName}Base`
+      lines.push(`export class ${className} {`)
+      lines.push(`  private base: Airtable.Base`)
+      lines.push(`  static readonly _id: string = '${base.id}'`)
+      lines.push(`  static readonly _name: string = '${base.name}'`)
+      lines.push(
+        `  constructor(options: Airtable.AirtableOptions) { this.base = new Airtable(options).base( ${className}._id); }`,
+      )
+      tables
+        .map((x) => ({ ...x, tname: pascalCase(x.name) }))
+        .forEach(({ tname, id }) =>
+          lines.push(`  get${tname}Table = ()=> this.base('${id}') as Airtable.Table<${tname}>;`),
+        )
+      lines.push('}', '')
     }
 
     return lines.join('\n')

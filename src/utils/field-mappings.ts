@@ -1,5 +1,7 @@
+import { printNode } from 'zod-to-ts'
+
 import { TableMetadata } from '../schemas/api'
-import { FieldMetadata } from '../schemas/fields'
+import { CellFormatTypescriptDefinitions, FieldMetadata, FieldType } from '../schemas/fields'
 import { getFieldEnumName } from './helpers'
 
 export function getZodType(table: TableMetadata, field: FieldMetadata) {
@@ -26,7 +28,7 @@ export function getZodType(table: TableMetadata, field: FieldMetadata) {
     case 'number':
     case 'percent':
     case 'currency': {
-      if ('options' in field && field.options.precision === 0) {
+      if ('options' in field && field?.options?.precision === 0) {
         return 'z.number().int().positive()'
       } else {
         return 'z.number().positive()'
@@ -38,6 +40,7 @@ export function getZodType(table: TableMetadata, field: FieldMetadata) {
       return 'z.number().min(0).max(5)'
     case 'email':
       return 'z.string().email()'
+    case 'aiText':
     case 'multilineText':
     case 'phoneNumber':
     case 'singleLineText':
@@ -78,99 +81,185 @@ export const AttachmentZodTmpl = `export const AirtableThumbnailSchema = z.objec
   url: z.string(),
   width: z.number(),
   height: z.number(),
-})
-
-export const AirtableAttachmentSchema = z.object({
-  id: z.string(),
-  url: z.string(),
-  filename: z.string(),
-  size: z.number(),
-  type: z.string(),
-  thumbnails: z.object({
-    small: AirtableThumbnailSchema,
-    large: AirtableThumbnailSchema,
-    full: AirtableThumbnailSchema,
-  }).optional(),
 })`
 
-export function getTsType(field: FieldMetadata) {
+function getTsForFieldType(type: FieldType): string {
+  return printNode(CellFormatTypescriptDefinitions[type])
+}
+
+export interface TsOptions {
+  useAirtableLibraryTypes: boolean
+}
+
+export function getTsType(field: FieldMetadata, opts: TsOptions) {
   switch (field.type) {
-    case 'number':
+    case 'aiText':
+    case 'button':
+      return opts.useAirtableLibraryTypes ? 'string' : getTsForFieldType(field.type) // TODO: this is wrong, but at least it has 'url', and the Airtable JS library has the wrong definition for FieldSet
+    case 'autoNumber':
+    case 'barcode':
+    case 'checkbox':
     case 'count':
     case 'currency':
-    case 'percent':
-    case 'rating':
-    case 'autoNumber':
+    case 'date':
+    case 'dateTime':
     case 'duration':
-      return 'number'
     case 'email':
+    case 'externalSyncSource':
     case 'multilineText':
+    case 'multipleCollaborators':
+    case 'multipleRecordLinks':
+    case 'number':
+    case 'percent':
     case 'phoneNumber':
+    case 'rating':
+    case 'richText':
     case 'singleLineText':
     case 'url':
-    case 'richText':
-      return 'string'
-    case 'rollup':
-    case 'formula':
-      return 'number | string'
-    case 'barcode':
-      return `{ text: string; type: string; }`
-    case 'button':
-      return `{ label: string; } & Record<string, unknown>`
-    case 'checkbox':
-      return 'boolean'
+      return getTsForFieldType(field.type)
     case 'createdBy':
     case 'lastModifiedBy':
     case 'singleCollaborator':
-      return 'IAirtableCollaborator'
-    case 'multipleCollaborators':
-      return `Array<IAirtableCollaborator>`
-    // Dates are strings in the API
-    case 'date':
-    case 'dateTime':
-    case 'createdTime':
-    case 'lastModifiedTime':
-      return 'string'
+      return opts.useAirtableLibraryTypes ? 'Airtable.Collaborator' : 'IAirtableCollaborator'
     case 'multipleAttachments':
-      return 'Array<IAirtableAttachment>'
+      return opts.useAirtableLibraryTypes ? 'Airtable.Attachment[]' : 'Array<IAirtableAttachment>'
+    case 'createdTime':
+    case 'formula':
+    case 'lastModifiedTime':
     case 'multipleLookupValues':
-      return 'Array<string | boolean | number | Record<string, unknown>>'
-    case 'multipleRecordLinks':
-      return 'Array<string>'
+    case 'rollup':
+      return getTsForFieldType(field.options?.result?.type ?? field.type) // use derrived type if available
     case 'singleSelect':
       return field.options.choices.map((choice) => `'${choice.name}'`).join(' | ')
     case 'multipleSelects':
       return `Array<${field.options.choices.map((choice) => `'${choice.name}'`).join(' | ')}>`
-    // TODO not sure what this one is
-    case 'externalSyncSource':
-      return 'unknown'
   }
 
   // @ts-expect-error - we should never fall through to here, but just in case
   throw new Error(`Unrecognized field type: ${field.type} (on field '${field.name}')`)
 }
 
-export const CollaboratorTsTmpl = `export interface IAirtableCollaborator {
-  id: string
-  email: string
-  name: string
-}`
-
-export const AttachmentTsTmpl = `export interface IAirtableThumbnail {
-  url: string
-  width: number
-  height: number
+function getAdditionalTsForAttachments(){
+  return `
+  export interface IAirtableThumbnail {
+    url: string
+    width: number
+    height: number
+  }
+  export interface IAirtableAttachment {
+    id: string
+    url: string
+    filename: string
+    size: number
+    type: string
+    thumbnails?: {
+      small: IAirtableThumbnail
+      large: IAirtableThumbnail
+      full: IAirtableThumbnail
+    }
+  }
+  `
+}
+function getAdditionalTsForCollaborators(){
+  return `
+  export interface IAirtableCollaborator {
+    id: string
+    email: string
+    name: string
+  }
+  `
 }
 
-export interface IAirtableAttachment {
-  id: string
-  url: string
-  filename: string
-  size: number
-  type: string
-  thumbnails?: {
-    small: IAirtableThumbnail
-    large: IAirtableThumbnail
-    full: IAirtableThumbnail
-  }
-}`
+export const tsExtras = {
+  getAdditionalTsForAttachments,
+  getAdditionalTsForCollaborators
+}
+
+// export interface IAirtableFieldSet {
+//     [key: string]: undefined | IAirtableFieldValue;
+// }
+
+// export declare type IAirtableRecords<TFields extends IAirtableFieldSet> = ReadonlyArray<IAirtableRecord<TFields>>;
+
+// export interface IAirtableRecordData<TFields> {
+//   id: string;
+//   fields: TFields;
+//   commentCount?: number;
+// }
+// export interface IAirtableSortParameter<TFields> {
+//   field: keyof TFields;
+//   direction?: 'asc' | 'desc';
+// }
+// export interface IAirtableQueryParams<TFields> {
+//   fields?: (keyof TFields)[];
+//   filterByFormula?: string;
+//   maxRecords?: number;
+//   pageSize?: number;
+//   offset?: number;
+//   sort?: IAirtableSortParameter<TFields>[];
+//   view?: string;
+//   cellFormat?: 'json' | 'string';
+//   timeZone?: string;
+//   userLocale?: string;
+//   method?: string;
+//   returnFieldsByFieldId?: boolean;
+//   recordMetadata?: string[];
+// }
+
+// export const LookupTsName = `IAirtableLookup`
+// export const LookupTsTmpl = `export type ${LookupTsName} = Array<string | boolean | number | Record<string, unknown>>`
+
+// export const CollaboratorTsName = `IAirtableCollaborator`
+
+// export const CollaboratorTsTmpl = `export interface ${CollaboratorTsName} {
+//   id: string
+//   email: string
+//   name: string
+// }`
+
+// export const ThumbnailTsName = `IAirtableThumbnail`
+// export const ThumbnailTsTmpl = `export interface IAirtableThumbnail {
+//   url: string
+//   width: number
+//   height: number
+// }`
+
+// export const AttachmentTsName = `IAirtableAttachment`
+// export const AttachmentTsImpl = `export interface ${AttachmentTsName} {
+//     id: string
+//     url: string
+//     filename: string
+//     size: number
+//     type: string
+//     thumbnails?: {
+//       small: IAirtableThumbnail
+//       large: IAirtableThumbnail
+//       full: IAirtableThumbnail
+//     }
+//   }`
+
+// // All fields must conform to this type to be compatible with the Airtable JS SDK
+// export const FieldTsImpl = `string | number | boolean | ${CollaboratorTsName} | readonly ${CollaboratorTsName}[] | readonly string[] | readonly ${AttachmentTsName}[] | undefined`
+
+// export interface Collaborator {
+//   id: string;
+//   email: string;
+//   name: string;
+// }
+// export interface Thumbnail {
+//   url: string;
+//   width: number;
+//   height: number;
+// }
+// export interface Attachment {
+//   id: string;
+//   url: string;
+//   filename: string;
+//   size: number;
+//   type: string;
+//   thumbnails?: {
+//       small: Thumbnail;
+//       large: Thumbnail;
+//       full: Thumbnail;
+//   };
+// }

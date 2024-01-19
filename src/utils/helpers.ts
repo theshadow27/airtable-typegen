@@ -1,10 +1,10 @@
 import { pascalCase } from 'change-case'
 
 import { TableMetadata } from '../schemas/api'
-import { FieldMetadata, ReadonlyFieldTypes } from '../schemas/fields'
+import { FieldMetadata, ReadOnlyFieldTypeNames } from '../schemas/fields'
 
 export function isReadonlyField(field: FieldMetadata) {
-  return Object.keys(ReadonlyFieldTypes.Enum).includes(field.type)
+  return Object.keys(ReadOnlyFieldTypeNames.Enum).includes(field.type)
 }
 
 export function hasCollaboratorField(fields: FieldMetadata[]) {

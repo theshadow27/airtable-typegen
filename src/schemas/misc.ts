@@ -1,5 +1,17 @@
 import { z } from 'zod'
 
+export const BrightColors = z.enum([
+  'yellowBright',
+  'orangeBright',
+  'redBright',
+  'pinkBright',
+  'purpleBright',
+  'blueBright',
+  'cyanBright',
+  'tealBright',
+  'greenBright',
+  'grayBright',
+])
 export const SelectColors = z.enum([
   'blueLight2',
   'cyanLight2',

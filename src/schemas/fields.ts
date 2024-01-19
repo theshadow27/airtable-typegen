@@ -1,16 +1,16 @@
 import { z } from 'zod'
+import { zodToTs } from 'zod-to-ts'
+import { DateFormat, DurationFormat, SelectColors, BrightColors, TimeFormat, TimeZone } from './misc'
+import ts from 'typescript'
 
-import { DateFormat, DurationFormat, SelectColors, TimeFormat, TimeZone } from './misc'
-
-/**
- * All Airtable field types, according to:
- * https://airtable.com/api/meta
- */
-export const AllFieldTypes = z.enum([
+const AllFieldTypeNames = z.enum([
+  'aiText',
+  'multipleAttachments',
   'autoNumber',
   'barcode',
   'button',
   'checkbox',
+  'singleCollaborator',
   'count',
   'createdBy',
   'createdTime',
@@ -19,15 +19,13 @@ export const AllFieldTypes = z.enum([
   'dateTime',
   'duration',
   'email',
-  'externalSyncSource',
   'formula',
   'lastModifiedBy',
   'lastModifiedTime',
-  'multilineText',
-  'multipleAttachments',
-  'multipleCollaborators',
-  'multipleLookupValues',
   'multipleRecordLinks',
+  'multilineText',
+  'multipleLookupValues', // Note that the web docs say this is 'lookup' but it actually comes back as 'multipleLookupValues' ???
+  'multipleCollaborators',
   'multipleSelects',
   'number',
   'percent',
@@ -35,17 +33,20 @@ export const AllFieldTypes = z.enum([
   'rating',
   'richText',
   'rollup',
-  'singleCollaborator',
   'singleLineText',
   'singleSelect',
+  'externalSyncSource',
   'url',
 ])
+
+export type FieldType = z.infer<typeof AllFieldTypeNames>
 
 /**
  * Computed fields cannot be updated via the API.
  * WARN: This list has not been verified for completeness/correctness.
  */
-export const ReadonlyFieldTypes = z.enum([
+export const ReadOnlyFieldTypeNames = z.enum([
+  'aiText',
   'autoNumber',
   'button',
   'count',
@@ -53,144 +54,673 @@ export const ReadonlyFieldTypes = z.enum([
   'createdTime',
   'externalSyncSource',
   'formula',
+  'lookup',
   'lastModifiedBy',
   'lastModifiedTime',
   'multipleLookupValues',
   'rollup',
 ])
 
-/**
- * Basic field types do not required any extra metadata to infer their TypeScript/Zod type
- */
-export const BasicFieldTypes = z.enum([
-  'autoNumber',
-  'barcode',
-  'button',
-  'checkbox',
-  'count',
-  'createdBy',
-  'email',
-  'formula',
-  'lastModifiedBy',
-  'multilineText',
-  'multipleAttachments',
-  'multipleCollaborators',
-  'multipleLookupValues',
-  'multipleRecordLinks',
-  'phoneNumber',
-  'richText',
-  'rollup',
-  'singleCollaborator',
-  'singleLineText',
-  'url',
-])
+export type ReadOnlyFieldType = z.infer<typeof ReadOnlyFieldTypeNames>
+
+export const ReadWriteFieldType = AllFieldTypeNames.refine(
+  (type: FieldType) => !Object.keys(ReadOnlyFieldTypeNames.Values).includes(type),
+  { message: 'Read-only field types are not supported.' },
+)
+export type ReadWriteFieldType = z.infer<typeof ReadWriteFieldType>
+
+// From https://airtable.com/developers/web/api/field-model
+
+export const AllCellFormats = z.lazy(() =>
+  z.union([AITextCellFormat, AttachmentCellFormat, AutoNumberCellFormat, BarcodeCellFormat]),
+)
 
 const BasicField = z.object({
-  type: BasicFieldTypes,
+  type: AllFieldTypeNames,
   name: z.string(),
   id: z.string(),
 })
 
-const PreciseNumberField = BasicField.extend({
-  type: z.enum(['number', 'currency', 'percent']),
+/**
+ * Used for computed fields 'result' property. It might not have an id etc
+ */
+const GenericFieldResult = z.object({
+  type: AllFieldTypeNames,
+  name: z.string().optional(),
+  id: z.string().optional(),
+  options: z.record(z.unknown()).optional(),
+})
+
+const FieldWithType = <Type extends FieldType>(
+  params:
+    | { type: ReadOnlyFieldType & Type; readOnly: true }
+    | { type: ReadWriteFieldType & Type; readOnly?: false | undefined },
+) => {
+  const { type } = params
+  return BasicField.extend({ type: z.literal(type) })
+}
+
+const FieldWithOptions = <Type extends FieldType, Options extends z.ZodTypeAny>(
+  params:
+    | { type: ReadOnlyFieldType & Type; readOnly: true; options: Options }
+    | { type: ReadWriteFieldType & Type; readOnly?: false | undefined; options: Options },
+) => {
+  const { type, options } = params
+  return BasicField.extend({ type: z.literal(type), options })
+}
+
+// *   [Date](https://airtable.com/developers/web/api/field-model#date-only)  - OUT OF ORDER DUE TO REUSE
+const DateFieldType = 'date'
+const DateFieldOptions = z.object({ dateFormat: DateFormat })
+// *   [Date and time](https://airtable.com/developers/web/api/field-model#date-and-time) - OUT OF ORDER DUE TO REUSE
+const DateTimeFieldType = 'dateTime'
+const DateTimeFieldOptions = z.object({
+  dateFormat: DateFormat,
+  timeFormat: TimeFormat,
+  timeZone: TimeZone,
+})
+
+// Used for CreatedTime and
+const DateOrDateTimeResult = z.discriminatedUnion('type', [
+  GenericFieldResult.extend({
+    type: z.literal(DateFieldType),
+    options: DateFieldOptions.optional(),
+  }),
+  GenericFieldResult.extend({
+    type: z.literal(DateTimeFieldType),
+    options: DateTimeFieldOptions.optional(),
+  }),
+])
+
+// *   [AI Text](https://airtable.com/developers/web/api/field-model#ai-text)
+const AITextFieldType = 'aiText'
+const AITextCellFormat = z
+  .discriminatedUnion('state', [
+    z.object({
+      state: z.enum(['empty', 'loading', 'generated']),
+      isStale: z.boolean(),
+      value: z.string().nullable().describe('The value that is shown to the user inside of the cell'),
+    }),
+    z.object({
+      state: z.literal('error'),
+      errorType: z.string(),
+      isStale: z.boolean(),
+      value: z.string().nullable(),
+    }),
+  ])
+  .describe('Field that contains text generated by AI.')
+const AITextField = FieldWithOptions({
+  type: AITextFieldType,
+  readOnly: true,
+  options: z.object({
+    prompt: z
+      .array(z.string())
+      .or(z.array(z.object({ field: z.object({ fieldId: z.string() }) })))
+      .optional()
+      .describe('The prompt that is used to generate the results in the AI field, '),
+    referencedFieldIds: z.array(z.string()).optional(),
+  }),
+})
+
+// *   [Attachment](https://airtable.com/developers/web/api/field-model#multiple-attachment)
+const AttachmentFieldType = 'multipleAttachments'
+const AirtableThumbnailSchema = z.object({
+  url: z.string(),
+  width: z.number(),
+  height: z.number(),
+})
+const AttachmentSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  filename: z.string(),
+  height: z.number(),
+  size: z.number(),
+  url: z.string(),
+  width: z.number(),
+  thumbnails: z.object({
+    small: AirtableThumbnailSchema.optional(),
+    large: AirtableThumbnailSchema.optional(),
+    full: AirtableThumbnailSchema.optional(),
+  }),
+})
+const AttachmentCellFormat = z
+  .array(AttachmentSchema)
+  .describe('Attachments allow you to add images, documents, or other files which can then be viewed or downloaded.')
+const AttachmentCellSchemaWrite = z.object({
+  id: z.string(),
+  filename: z.string().optional(),
+  url: z.string(),
+})
+const AttachmentCellFormatWrite = z.array(AttachmentCellSchemaWrite)
+const AttachmentField = FieldWithOptions({
+  type: AttachmentFieldType,
+  options: z.object({
+    isReversed: z.boolean(),
+  }),
+})
+
+// *   [Auto number](https://airtable.com/developers/web/api/field-model#auto-number)
+const AutoNumberFieldType = 'autoNumber'
+const AutoNumberCellFormat = z.number().describe('Automatically incremented unique counter for each record.') // read-only
+const AutoNumberField = FieldWithType({ type: AutoNumberFieldType, readOnly: true })
+
+// *   [Barcode](https://airtable.com/developers/web/api/field-model#barcode)
+const BarcodeFieldType = 'barcode'
+const BarcodeCellFormat = z
+  .object({
+    type: z.string().optional(),
+    text: z.string(),
+  })
+  .describe('Use the Airtable iOS or Android app to scan barcodes.')
+const BarcodeField = FieldWithType({ type: BarcodeFieldType })
+
+// *   [Button](https://airtable.com/developers/web/api/field-model#button)
+
+const ButtonFieldType = 'button'
+const ButtonCellFormat = z
+  .object({
+    label: z.string(),
+    url: z.string().nullish(),
+  })
+  .describe('A button that can be clicked from the Airtable UI to open a URL or open an extension.')
+const ButtonField = FieldWithType({ type: ButtonFieldType, readOnly: true })
+
+// *   [Checkbox](https://airtable.com/developers/web/api/field-model#checkbox)
+const CheckboxFieldType = 'checkbox'
+const CheckboxCellFormat = z.boolean().optional().describe('true if checked')
+const CheckboxField = FieldWithOptions({
+  type: CheckboxFieldType,
+  options: z.object({
+    color: BrightColors,
+    icon: z.enum(['check', 'xCheckbox', 'star', 'heart', 'thumbsUp', 'flag', 'dot']),
+  }),
+})
+
+// *   [Collaborator](https://airtable.com/developers/web/api/field-model#collaborator)
+const CollaboratorFieldType = 'singleCollaborator'
+const CollaboratorCellFormat = z
+  .object({
+    id: z.string(),
+    email: z.string().optional(),
+    name: z.string().optional(),
+    profilePicUrl: z.string().optional(),
+  })
+  .describe('A collaborator field lets you add collaborators to your records.')
+const CollaboratorCellFormatWrite = z.object({
+  id: z.string(),
+  email: z.string(),
+})
+const CollaboratorField = FieldWithOptions({
+  type: CollaboratorFieldType,
+  options: z.record(z.unknown()).optional(),
+})
+
+// *   [Count](https://airtable.com/developers/web/api/field-model#count)
+const CountFieldType = 'count'
+const CountCellFormat = z.number().describe('Number of linked records, from a linked record field in the same table.')
+const CountField = FieldWithOptions({
+  type: CountFieldType,
+  readOnly: true,
+  options: z.object({
+    isValid: z.boolean(),
+    recordLinkFieldId: z.string().nullish(),
+  }),
+})
+
+// *   [Created by](https://airtable.com/developers/web/api/field-model#created-by)
+const CreatedByFieldType = 'createdBy'
+const CreatedByCellFormat = CollaboratorCellFormat.describe('The collaborator who created the record')
+const CreatedByField = FieldWithType({ type: CreatedByFieldType, readOnly: true })
+
+// *   [Created time](https://airtable.com/developers/web/api/field-model#created-time)
+const CreatedTimeFieldType = 'createdTime'
+const CreatedTimeField = FieldWithOptions({
+  type: CreatedTimeFieldType,
+  readOnly: true,
+  options: z.object({
+    result: DateOrDateTimeResult.optional(),
+  }),
+})
+const CreatedTimeCellFormat = z
+  .string()
+  .describe('The time the record was created in UTC e.g. "2022-08-29T07:00:00.000Z" or "2022-08-29"')
+
+// *   [Currency](https://airtable.com/developers/web/api/field-model#currency-number)
+const CurrencyFieldType = 'currency'
+const CurrencyCellFormat = z.number().describe('Currency value. Symbol set with the field config.')
+const CurrencyField = FieldWithOptions({
+  type: CurrencyFieldType,
+  options: z.object({
+    precision: z.number().min(0).max(7),
+    symbol: z.string().optional(),
+  }),
+})
+
+// *   [Date](https://airtable.com/developers/web/api/field-model#date-only)
+//const DateFieldType = 'date' // DEFINED ABOVE DUE TO RE-USE
+const DateCellFormat = z.string().describe('Date value in ISO 8601 format, e.g. "2022-08-29"')
+const DateField = FieldWithOptions({
+  type: DateFieldType,
+  options: DateFieldOptions, // z.object({ dateFormat: DateFormat })
+})
+// *   [Date and time](https://airtable.com/developers/web/api/field-model#date-and-time)
+// const DateTimeFieldType = 'dateTime' // DEFINED ABOVE DUE TO RE-USE
+const DateTimeCellFormat = z
+  .string()
+  .describe('UTC Date and time value in ISO 8601 format, e.g. "2022-08-29T07:00:00.000Z"')
+const DateTimeField = FieldWithOptions({
+  type: DateTimeFieldType,
+  options: DateTimeFieldOptions, // z.object({dateFormat: DateFormat, timeFormat: TimeFormat, timeZone: TimeZone, })
+})
+
+// *   [Duration](https://airtable.com/developers/web/api/field-model#duration-number)
+const DurationFieldType = 'duration'
+const DurationCellFormat = z.number().describe('Duration value in seconds')
+const DurationField = FieldWithOptions({
+  type: DurationFieldType,
+  options: z.object({ durationFormat: DurationFormat }),
+})
+
+// *   [Email](https://airtable.com/developers/web/api/field-model#email-text)
+const EmailFieldType = 'email'
+const EmailCellFormat = z.string().describe('A valid email address')
+const EmailField = FieldWithType({ type: EmailFieldType })
+
+// *   [Formula](https://airtable.com/developers/web/api/field-model#formula)
+const FormulaFieldType = 'formula'
+const ForumlaCellFormat = z
+  .union([z.string(), z.number(), z.array(z.string()), z.array(z.number())])
+  .describe('The result of the formula')
+const FormulaField = FieldWithOptions({
+  // string | number | array of (strings | numbers)
+  type: FormulaFieldType,
+  readOnly: true,
+  options: z.object({
+    formula: z.string(),
+    isValid: z.boolean(),
+    referencedFieldIds: z.array(z.string()).nullish(),
+    result: GenericFieldResult.describe('The resulting field type and options returned by the formula.'),
+  }),
+})
+
+// *   [Last modified by](https://airtable.com/developers/web/api/field-model#last-modified-by)
+const LastModifiedByFieldType = 'lastModifiedBy'
+const LastModifiedByCellFormat = CollaboratorCellFormat.describe('The collaborator who last modified the record')
+const LastModifiedByField = FieldWithType({ type: LastModifiedByFieldType, readOnly: true })
+
+// *   [Last modified time](https://airtable.com/developers/web/api/field-model#last-modified-time)
+const LastModifiedTimeFieldType = 'lastModifiedTime'
+const LastModifiedTimeField = FieldWithOptions({
+  type: LastModifiedTimeFieldType,
+  readOnly: true,
+  options: z.object({
+    result: DateOrDateTimeResult.optional(),
+  }),
+})
+const LastModifiedTimeCellFormat = z
+  .string()
+  .describe('The time the record was last modified in UTC e.g. "2022-08-29T07:00:00.000Z" or "2022-08-29"')
+
+// *   [Link to another record](https://airtable.com/developers/web/api/field-model#foreign-key)
+const MultipleRecordLinksFieldType = 'multipleRecordLinks'
+const MultipleRecordLinksCellFormat = z.array(z.string()).describe('Array of record IDs')
+const MultipleRecordLinksField = FieldWithOptions({
+  type: MultipleRecordLinksFieldType,
+  options: z.object({
+    isReversed: z.boolean().optional(),
+    linkedTableId: z.string(),
+    prefersSingleRecordLink: z.boolean(),
+    inverseLinkFieldId: z.string().optional(),
+    viewIdForRecordSelection: z.string().optional(),
+  }),
+})
+
+// *   [Long text](https://airtable.com/developers/web/api/field-model#multiline-text)
+const LongTextFieldType = 'multilineText'
+const LongTextCellFormat = z
+  .string()
+  .describe(
+    'Multiple lines of text, which may contain "mention tokens", e.g. <airtable:mention id="menE1i9oBaGX3DseR">@Alex</airtable:mention>',
+  )
+const LongTextField = FieldWithType({ type: LongTextFieldType })
+
+// *   [Lookup](https://airtable.com/developers/web/api/field-model#lookup)
+const LookupFieldType = 'multipleLookupValues' // Note that the web docs say this is 'lookup' but it actually comes back as 'multipleLookupValues' ???
+const LookupCellFormat = z
+  .array(z.union([z.string(), z.number(), z.boolean(), z.object({})]))
+  .describe('Array of values from the linked record')
+const LookupField = FieldWithOptions({
+  type: LookupFieldType,
+  readOnly: true,
+  options: z.object({
+    fieldIdInLinkedTable: z.string().optional(),
+    isValid: z.boolean().optional(),
+    recordLinkFieldId: z.string().optional(),
+    result: GenericFieldResult.optional(),
+  }),
+})
+
+// *   [Multiple collaborator](https://airtable.com/developers/web/api/field-model#multi-collaborator)
+const MultipleCollaboratorsFieldType = 'multipleCollaborators'
+const MultipleCollaboratorsCellFormat = z.array(CollaboratorCellFormat).describe('Array of collaborators')
+const MultipleCollaboratorsCellFormatWrite = z.array(z.string()).describe('Array of user or group ids')
+const MultipleCollaboratorsField = FieldWithOptions({
+  type: MultipleCollaboratorsFieldType,
+  options: z.record(z.unknown()).optional(),
+})
+
+// *   [Multiple select](https://airtable.com/developers/web/api/field-model#multi-select)
+const MultipleSelectsFieldType = 'multipleSelects'
+const MultipleSelectsCellFormat = z.array(z.string()).describe('Array of option names')
+const MultipleSelectsField = FieldWithOptions({
+  type: MultipleSelectsFieldType,
+  options: z.object({
+    choices: z.array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        color: SelectColors.optional(),
+      }),
+    ),
+  }),
+})
+
+// *   [Number](https://airtable.com/developers/web/api/field-model#decimal-or-integer-number)
+const NumberFieldType = 'number'
+const NumberCellFormat = z
+  .number()
+  .describe('A integer(whole number, e.g. 1, 32, 99) or decimal number showing decimal digits.')
+const NumberField = FieldWithOptions({
+  type: NumberFieldType,
   options: z.object({
     precision: z.number().min(0).max(8),
   }),
 })
 
-const DateSubField = z.object({
-  type: z.literal('date'),
-  options: z.object({ dateFormat: DateFormat }),
-})
-const DateTimeSubField = z.object({
-  type: z.literal('dateTime'),
+// *   [Percent](https://airtable.com/developers/web/api/field-model#percent-number)
+const PercentFieldType = 'percent'
+const PercentCellFormat = z.number().describe('Decimal number representing a percentage value. E.g. 12.3% is 0.123.')
+const PercentField = FieldWithOptions({
+  type: PercentFieldType,
   options: z.object({
-    dateFormat: DateFormat,
-    timeFormat: TimeFormat,
-    timeZone: TimeZone,
-  }),
-})
-const DateField = BasicField.merge(DateSubField)
-const DateTimeField = BasicField.merge(DateTimeSubField)
-const CreatedTimeField = BasicField.extend({
-  type: z.literal('createdTime'),
-  options: z.object({
-    result: z.discriminatedUnion('type', [DateSubField, DateTimeSubField]),
+    precision: z.number().min(0).max(8),
   }),
 })
 
-const ExternalSyncSourceField = BasicField.extend({
-  type: z.literal('externalSyncSource'),
-  options: z.object({
-    choices: z.array(
-      z.object({
-        id: z.string(),
-        name: z.string(),
-        color: SelectColors.optional(),
-      }),
-    ),
-  }),
-})
+// *   [Phone](https://airtable.com/developers/web/api/field-model#phone)
+const PhoneFieldType = 'phoneNumber'
+const PhoneCellFormat = z.string().describe('A valid phone number')
+const PhoneField = FieldWithType({ type: PhoneFieldType })
 
-const LastModifiedTimeField = BasicField.extend({
-  type: z.literal('lastModifiedTime'),
+// *   [Rating](https://airtable.com/developers/web/api/field-model#rating)
+const RatingFieldType = 'rating'
+const RatingCellFormat = z.number().describe('Rating value from 1 to 10')
+const RatingField = FieldWithOptions({
+  type: RatingFieldType,
   options: z.object({
-    result: z.discriminatedUnion('type', [DateSubField, DateTimeSubField]),
-  }),
-})
-
-const DurationField = BasicField.extend({
-  type: z.literal('duration'),
-  options: z.object({ durationFormat: DurationFormat }),
-})
-
-const MultipleSelectsField = BasicField.extend({
-  type: z.literal('multipleSelects'),
-  options: z.object({
-    choices: z.array(
-      z.object({
-        id: z.string(),
-        name: z.string(),
-        color: SelectColors.optional(),
-      }),
-    ),
-  }),
-})
-const SingleSelectField = MultipleSelectsField.extend({
-  type: z.literal('singleSelect'),
-})
-
-const RatingField = BasicField.extend({
-  type: z.literal('rating'),
-  options: z.object({
-    color: z.enum([
-      'yellowBright',
-      'orangeBright',
-      'redBright',
-      'pinkBright',
-      'purpleBright',
-      'blueBright',
-      'cyanBright',
-      'tealBright',
-      'greenBright',
-      'grayBright',
-    ]),
+    color: BrightColors,
     icon: z.enum(['star', 'heart', 'thumbsUp', 'flag', 'dot']),
     max: z.number().min(1).max(10),
   }),
 })
 
+// *   [Rich text](https://airtable.com/developers/web/api/field-model#rich-text)
+const RichTextFieldType = 'richText'
+const RichTextCellFormat = z.string().describe('Long text (with rich text formatting enabled)')
+const RichTextField = FieldWithType({ type: RichTextFieldType })
+
+// *   [Rollup](https://airtable.com/developers/web/api/field-model#rollup)
+const RollupFieldType = 'rollup'
+const RollupCellFormat = z.union([z.string(), z.number()]).describe('The result of the rollup')
+const RollupField = FieldWithOptions({
+  // string | number
+  type: RollupFieldType,
+  readOnly: true,
+  options: z.object({
+    fieldIdInLinkedTable: z.string().optional(),
+    recordLinkFieldId: z.string().optional(),
+    result: GenericFieldResult.optional(),
+    isValid: z.boolean().optional(),
+    referencedFieldIds: z.array(z.string()).optional(),
+  }),
+})
+
+// *   [Single line text](https://airtable.com/developers/web/api/field-model#simple-text)
+const SingleLineTextFieldType = 'singleLineText'
+const SingleLineTextCellFormat = z.string().describe('Single line of text')
+const SingleLineTextField = FieldWithType({ type: SingleLineTextFieldType })
+
+// *   [Single select](https://airtable.com/developers/web/api/field-model#select)
+const SingleSelectFieldType = 'singleSelect'
+const SingleSelectCellFormat = z.string().describe('Option name')
+const SingleSelectField = FieldWithOptions({
+  type: SingleSelectFieldType,
+  options: z.object({
+    choices: z.array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        color: SelectColors.optional(),
+      }),
+    ),
+  }),
+})
+// *   [Sync source](https://airtable.com/developers/web/api/field-model#sync-source)
+const SyncSourceType = 'externalSyncSource'
+const SyncSourceCellFormat = z.string().describe('The name of the linked record')
+const SyncSourceField = FieldWithOptions({
+  type: SyncSourceType,
+  readOnly: true,
+  options: z.object({
+    choices: z.array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        color: SelectColors.optional(),
+      }),
+    ),
+  }),
+})
+
+// *   [Url](https://airtable.com/developers/web/api/field-model#url-text)
+const UrlFieldType = 'url'
+const UrlCellFormat = z.string().describe('A valid URL')
+const UrlField = FieldWithType({ type: UrlFieldType })
+
+// ##########################
+// ##### Begin Exports ######
+// ##########################
+
+/** All Field Schema Objects */
+
 export const FieldMetadataSchema = z.discriminatedUnion('type', [
-  BasicField,
-  PreciseNumberField,
+  AITextField,
+  AttachmentField,
+  AutoNumberField,
+  BarcodeField,
+  ButtonField,
+  CheckboxField,
+  CollaboratorField,
+  CountField,
+  CreatedByField,
+  CreatedTimeField,
+  CurrencyField,
   DateField,
   DateTimeField,
-  CreatedTimeField,
-  ExternalSyncSourceField,
-  LastModifiedTimeField,
   DurationField,
+  EmailField,
+  FormulaField,
+  LastModifiedByField,
+  LastModifiedTimeField,
+  MultipleRecordLinksField,
+  LongTextField,
+  LookupField,
+  MultipleCollaboratorsField,
   MultipleSelectsField,
-  SingleSelectField,
+  NumberField,
+  PercentField,
+  PhoneField,
   RatingField,
+  RichTextField,
+  RollupField,
+  SingleLineTextField,
+  SingleSelectField,
+  SyncSourceField,
+  UrlField,
 ])
+
 export type FieldMetadata = z.infer<typeof FieldMetadataSchema>
+
+/**
+ * Typescript Type Exports
+ */
+
+export type AITextMeta = z.infer<typeof AITextField>
+export type AttachmentMeta = z.infer<typeof AttachmentField>
+export type AutoNumberMeta = z.infer<typeof AutoNumberField>
+export type BarcodeMeta = z.infer<typeof BarcodeField>
+export type ButtonMeta = z.infer<typeof ButtonField>
+export type CheckboxMeta = z.infer<typeof CheckboxField>
+export type CollaboratorMeta = z.infer<typeof CollaboratorField>
+export type CountMeta = z.infer<typeof CountField>
+export type CreatedByMeta = z.infer<typeof CreatedByField>
+export type CreatedTimeMeta = z.infer<typeof CreatedTimeField>
+export type CurrencyMeta = z.infer<typeof CurrencyField>
+export type DateMeta = z.infer<typeof DateField>
+export type DateTimeMeta = z.infer<typeof DateTimeField>
+export type DurationMeta = z.infer<typeof DurationField>
+export type EmailMeta = z.infer<typeof EmailField>
+export type FormulaMeta = z.infer<typeof FormulaField>
+export type LastModifiedByMeta = z.infer<typeof LastModifiedByField>
+export type LastModifiedTimeMeta = z.infer<typeof LastModifiedTimeField>
+export type LongTextMeta = z.infer<typeof LongTextField>
+export type LookupMeta = z.infer<typeof LookupField>
+export type MultipleCollaboratorsMeta = z.infer<typeof MultipleCollaboratorsField>
+export type MultipleRecordLinksMeta = z.infer<typeof MultipleRecordLinksField>
+export type MultipleSelectsMeta = z.infer<typeof MultipleSelectsField>
+export type NumberMeta = z.infer<typeof NumberField>
+export type PercentMeta = z.infer<typeof PercentField>
+export type PhoneMeta = z.infer<typeof PhoneField>
+export type RatingMeta = z.infer<typeof RatingField>
+export type RichTextMeta = z.infer<typeof RichTextField>
+export type RollupMeta = z.infer<typeof RollupField>
+export type SingleLineTextMeta = z.infer<typeof SingleLineTextField>
+export type SingleSelectMeta = z.infer<typeof SingleSelectField>
+export type SyncSourceMeta = z.infer<typeof SyncSourceField>
+export type UrlMeta = z.infer<typeof UrlField>
+
+export const AllCellValuesSchema = z.union([
+  AITextCellFormat,
+  AttachmentCellFormat,
+  AutoNumberCellFormat,
+  BarcodeCellFormat,
+  ButtonCellFormat,
+  CheckboxCellFormat,
+  CollaboratorCellFormat,
+  CountCellFormat,
+  CreatedByCellFormat,
+  CreatedTimeCellFormat,
+  CurrencyCellFormat,
+  DateCellFormat,
+  DateTimeCellFormat,
+  DurationCellFormat,
+  EmailCellFormat,
+  ForumlaCellFormat,
+  LastModifiedByCellFormat,
+  LastModifiedTimeCellFormat,
+  LongTextCellFormat,
+  LookupCellFormat,
+  MultipleCollaboratorsCellFormat,
+  MultipleRecordLinksCellFormat,
+  MultipleSelectsCellFormat,
+  NumberCellFormat,
+  PercentCellFormat,
+  PhoneCellFormat,
+  RatingCellFormat,
+  RichTextCellFormat,
+  RollupCellFormat,
+  SingleLineTextCellFormat,
+  SingleSelectCellFormat,
+  SyncSourceCellFormat,
+  UrlCellFormat,
+])
+export type CellValue = z.infer<typeof AllCellValuesSchema>
+
+export type AIText = z.infer<typeof AITextCellFormat>
+export type Attachment = z.infer<typeof AttachmentCellFormat>
+export type AutoNumber = z.infer<typeof AutoNumberCellFormat>
+export type Barcode = z.infer<typeof BarcodeCellFormat>
+export type Button = z.infer<typeof ButtonCellFormat>
+export type Checkbox = z.infer<typeof CheckboxCellFormat>
+export type Collaborator = z.infer<typeof CollaboratorCellFormat>
+export type Count = z.infer<typeof CountCellFormat>
+export type CreatedBy = z.infer<typeof CreatedByCellFormat>
+export type CreatedTime = z.infer<typeof CreatedTimeCellFormat>
+export type Currency = z.infer<typeof CurrencyCellFormat>
+export type Date = z.infer<typeof DateCellFormat>
+export type DateTime = z.infer<typeof DateTimeCellFormat>
+export type Duration = z.infer<typeof DurationCellFormat>
+export type Email = z.infer<typeof EmailCellFormat>
+export type Formula = z.infer<typeof ForumlaCellFormat>
+export type LastModifiedBy = z.infer<typeof LastModifiedByCellFormat>
+export type LastModifiedTime = z.infer<typeof LastModifiedTimeCellFormat>
+export type LongText = z.infer<typeof LongTextCellFormat>
+export type Lookup = z.infer<typeof LookupCellFormat>
+export type MultipleCollaborators = z.infer<typeof MultipleCollaboratorsCellFormat>
+export type MultipleRecordLinks = z.infer<typeof MultipleRecordLinksCellFormat>
+export type MultipleSelects = z.infer<typeof MultipleSelectsCellFormat>
+export type Number = z.infer<typeof NumberCellFormat>
+export type Percent = z.infer<typeof PercentCellFormat>
+export type Phone = z.infer<typeof PhoneCellFormat>
+export type Rating = z.infer<typeof RatingCellFormat>
+export type RichText = z.infer<typeof RichTextCellFormat>
+export type Rollup = z.infer<typeof RollupCellFormat>
+export type SingleLineText = z.infer<typeof SingleLineTextCellFormat>
+export type SingleSelect = z.infer<typeof SingleSelectCellFormat>
+export type SyncSource = z.infer<typeof SyncSourceCellFormat>
+export type Url = z.infer<typeof UrlCellFormat>
+
+/**
+ * Typescript Type Definitions
+ */
+
+function zt(zodType: z.ZodTypeAny, tsTypeName: string): ts.Node {
+  const { node } = zodToTs(zodType, tsTypeName)
+  return node
+}
+
+export const CellFormatTypescriptDefinitions: Record<FieldType, ts.Node> = {
+  [AITextFieldType]: zt(AITextCellFormat, 'AIText'),
+  [AttachmentFieldType]: zt(AttachmentCellFormat, 'Attachment'),
+  [AutoNumberFieldType]: zt(AutoNumberCellFormat, 'AutoNumber'),
+  [BarcodeFieldType]: zt(BarcodeCellFormat, 'Barcode'),
+  [ButtonFieldType]: zt(ButtonCellFormat, 'Button'),
+  [CheckboxFieldType]: zt(CheckboxCellFormat, 'Checkbox'),
+  [CollaboratorFieldType]: zt(CollaboratorCellFormat, 'Collaborator'),
+  [CountFieldType]: zt(CountCellFormat, 'Count'),
+  [CreatedByFieldType]: zt(CreatedByCellFormat, 'CreatedBy'),
+  [CreatedTimeFieldType]: zt(CreatedTimeCellFormat, 'CreatedTime'),
+  [CurrencyFieldType]: zt(CurrencyCellFormat, 'Currency'),
+  [DateFieldType]: zt(DateCellFormat, 'Date'),
+  [DateTimeFieldType]: zt(DateTimeCellFormat, 'DateTime'),
+  [DurationFieldType]: zt(DurationCellFormat, 'Duration'),
+  [EmailFieldType]: zt(EmailCellFormat, 'Email'),
+  [FormulaFieldType]: zt(ForumlaCellFormat, 'Formula'),
+  [LastModifiedByFieldType]: zt(LastModifiedByCellFormat, 'LastModifiedBy'),
+  [LastModifiedTimeFieldType]: zt(LastModifiedTimeCellFormat, 'LastModifiedTime'),
+  [MultipleRecordLinksFieldType]: zt(MultipleRecordLinksCellFormat, 'MultipleRecordLinks'),
+  [LongTextFieldType]: zt(LongTextCellFormat, 'LongText'),
+  [LookupFieldType]: zt(LookupCellFormat, 'Lookup'),
+  [MultipleCollaboratorsFieldType]: zt(MultipleCollaboratorsCellFormat, 'MultipleCollaborators'),
+  [MultipleSelectsFieldType]: zt(MultipleSelectsCellFormat, 'MultipleSelects'),
+  [NumberFieldType]: zt(NumberCellFormat, 'Number'),
+  [PercentFieldType]: zt(PercentCellFormat, 'Percent'),
+  [PhoneFieldType]: zt(PhoneCellFormat, 'Phone'),
+  [RatingFieldType]: zt(RatingCellFormat, 'Rating'),
+  [RichTextFieldType]: zt(RichTextCellFormat, 'RichText'),
+  [RollupFieldType]: zt(RollupCellFormat, 'Rollup'),
+  [SingleLineTextFieldType]: zt(SingleLineTextCellFormat, 'SingleLineText'),
+  [SingleSelectFieldType]: zt(SingleSelectCellFormat, 'SingleSelect'),
+  [SyncSourceType]: zt(SyncSourceCellFormat, 'SyncSource'),
+  [UrlFieldType]: zt(UrlCellFormat, 'Url'),
+}
