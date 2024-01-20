@@ -299,7 +299,7 @@ Reads environment from .env file if present in current working directory.`
     }
 
     lines.push(`export type AirtableUid = string;`)
-    lines.push(`export type FieldSetWithId<T extends AirtableUid> = Airtable.FieldSet & { _id?: T };`)
+    lines.push(`export type FieldSetWithId<T extends AirtableUid> = Omit<Airtable.FieldSet, keyof Airtable.FieldSet> & { _id?: T };`)
     //if (genIds === 'Symbol') {
     //  genIds = `[$id]`
     //  lines.push(`export const $id = Symbol('__airtable_id__');`)
