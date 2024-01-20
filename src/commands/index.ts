@@ -292,26 +292,20 @@ Reads environment from .env file if present in current working directory.`
     const allFields = tables.map((t) => t.fields).flat()
 
     if (controllers) {
-      lines.push(`import Airtable from 'airtable';`)
+      // this includes: Airtable import, TypedTable, CachedQuery, FieldSetWithId, TypedSelectOptions, and AirtableUid
+      const contentsOfTypedDashTableTs = await fs.readFile(path.resolve(__dirname, '../static/typed-table.ts'), 'utf8')
+      lines.push(contentsOfTypedDashTableTs, '')
     } else {
       if (hasAttachmentField(allFields)) lines.push(tsExtras.getAdditionalTsForAttachments(), '')
       if (hasCollaboratorField(allFields)) lines.push(tsExtras.getAdditionalTsForCollaborators(), '')
+      lines.push(`export type AirtableUid = string;`)
     }
-
-    lines.push(`export type AirtableUid = string;`)
-    lines.push(`export type FieldSetWithId<T extends AirtableUid> = Omit<Airtable.FieldSet, keyof Airtable.FieldSet> & { _id?: T };`)
-    //if (genIds === 'Symbol') {
-    //  genIds = `[$id]`
-    //  lines.push(`export const $id = Symbol('__airtable_id__');`)
-    //}
-
+    lines.push('/* Begin Generated Types */', '')
     for (const table of tables) {
       const tableName = pascalCase(table.name)
-      lines.push('', `export type ${tableName}Id = AirtableUid;`, '')
+      lines.push(`export type ${tableName}Id = AirtableUid;`)
       lines.push(`export interface ${tableName}${controllers ? ' extends FieldSetWithId<' + tableName + 'Id>' : ''} {`)
-      lines.push(`  _id?: ${tableName}Id; // not respected by the official Airtable Library`)
-      // add the ID symbol when needed
-      //if (genIds) lines.push(`  ${genIds}: ${tableName}Id;`)
+      if (controllers) lines.push(`  _id?: ${tableName}Id; // not respected by the official Airtable Library`)
 
       for (const field of table.fields) {
         const fieldName = field.name
@@ -334,43 +328,14 @@ Reads environment from .env file if present in current working directory.`
 
       lines.push('}', '')
     }
+    lines.push('/* End Generated Types */', '')
 
     if (controllers) {
       const baseName = pascalCase(base.name)
       const className = `${baseName}Base`
-      lines.push(`
-export class TypedTable<ID extends AirtableUid, T extends FieldSetWithId<ID>> {
-  readonly _id : string
-  readonly _name : string
-  readonly table: Airtable.Table<T>
-  constructor(base: InstanceType<typeof Airtable.Base>, id: string, name: string) {
-    this._id = id
-    this._name = name
-    this.table = new Airtable.Table<T>(base, id, name);
-  }
-  async find(id: ID): Promise<T | undefined> {
-    const result = await this.table.find(id)
-    return result && result.fields ? {_id: id, ...result.fields} : undefined;
-  }
-  async select(options?: Airtable.SelectOptions<T>): Promise<T[]> {
-    const result = await this.table.select(options).all()
-    return result.map(r => ({_id: r.id, ...r.fields}))
-  }
-  async create(recordData: string | (Partial<T> & {_id: undefined})): Promise<T> {
-    const result = await this.table.create(recordData)
-    return {_id: result.id as ID, ...result.fields}
-  }
-  async update(recordData: Partial<T> & {_id: ID}): Promise<T> {
-    const {_id, ...fields } = recordData
-    const result = await this.table.update(_id, fields as Partial<T>)
-    return {_id, ...result.fields}
-  }
-  async destroy(id: ID): Promise<T> {
-    const result = await this.table.destroy(id)
-    return {_id: id, ...result.fields}
-  }
-}
-
+      lines.push(
+        '/* Begin controller */',
+        `
 export class ${className} {
   readonly at: Airtable
   readonly base: InstanceType<typeof Airtable.Base>
@@ -379,15 +344,14 @@ export class ${className} {
   constructor(options: Airtable.AirtableOptions) {
       this.at = new Airtable(options)
       this.base = new Airtable.Base(this.at, ${className}._id);
-  }`,'')
-
+}
+`)
       tables
         .map((x) => ({ ...x, tname: pascalCase(x.name) }))
-        .forEach(
-          ({ tname, id, name }) =>
-            lines.push(`  get${tname}Table = ()=> new TypedTable<${tname}Id, ${tname}>(this.base, '${id}', '${name}');`), //as Airtable.Table<${tname}>;`),
+        .forEach(({ tname, id, name }) =>
+          lines.push(`  get${tname}Table = ()=> new TypedTable<${tname}Id, ${tname}>(this.base, '${id}', '${name}');`),
         )
-      lines.push('}', '')
+      lines.push('}', '/* End controller */')
     }
 
     return lines.join('\n')
