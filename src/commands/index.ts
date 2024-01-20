@@ -60,7 +60,8 @@ Reads environment from .env file if present in current working directory.`
       required: false,
     }),
     id: Flags.boolean({
-      description: 'Use this key as the strongly typed IDs within the generated code (TypeScript only) reverse with --no-id',
+      description:
+        'Use this key as the strongly typed IDs within the generated code (TypeScript only) reverse with --no-id',
       required: false,
       default: true,
     }),
@@ -297,8 +298,8 @@ Reads environment from .env file if present in current working directory.`
       if (hasCollaboratorField(allFields)) lines.push(tsExtras.getAdditionalTsForCollaborators(), '')
     }
 
-    lines.push(`export type AirTableUid = string;`)
-
+    lines.push(`export type AirtableUid = string;`)
+    lines.push(`export type FieldSetWithId<T extends AirtableUid> = Airtable.FieldSet & { _id?: T };`)
     //if (genIds === 'Symbol') {
     //  genIds = `[$id]`
     //  lines.push(`export const $id = Symbol('__airtable_id__');`)
@@ -306,9 +307,9 @@ Reads environment from .env file if present in current working directory.`
 
     for (const table of tables) {
       const tableName = pascalCase(table.name)
-      lines.push('', `export type ${tableName}Id = AirTableUid;`, '')
-      lines.push(`export interface ${tableName}${controllers ? ' extends Airtable.FieldSet' : ''} {`)
-      lines.push(`  _id: ${tableName}Id; // not respected by the official Airtable Library`)
+      lines.push('', `export type ${tableName}Id = AirtableUid;`, '')
+      lines.push(`export interface ${tableName}${controllers ? ' extends FieldSetWithId<' + tableName + 'Id>' : ''} {`)
+      lines.push(`  _id?: ${tableName}Id; // not respected by the official Airtable Library`)
       // add the ID symbol when needed
       //if (genIds) lines.push(`  ${genIds}: ${tableName}Id;`)
 
@@ -321,7 +322,7 @@ Reads environment from .env file if present in current working directory.`
             .filter((t) => t.id == field.options.linkedTableId)
             .map((t) => pascalCase(t.name) + 'Id')
             .pop()
-          if (!linkedTableIdType) linkedTableIdType = 'AirTableUid' // ? Not found?
+          if (!linkedTableIdType) linkedTableIdType = 'AirtableUid' // ? Not found?
           fieldType = `Array<${linkedTableIdType}>`
         }
 
@@ -337,17 +338,54 @@ Reads environment from .env file if present in current working directory.`
     if (controllers) {
       const baseName = pascalCase(base.name)
       const className = `${baseName}Base`
-      lines.push(`export class ${className} {`)
-      lines.push(`  private base: Airtable.Base`)
-      lines.push(`  static readonly _id: string = '${base.id}'`)
-      lines.push(`  static readonly _name: string = '${base.name}'`)
-      lines.push(
-        `  constructor(options: Airtable.AirtableOptions) { this.base = new Airtable(options).base( ${className}._id); }`,
-      )
+      lines.push(`
+export class TypedTable<ID extends AirtableUid, T extends FieldSetWithId<ID>> {
+  readonly _id : string
+  readonly _name : string
+  readonly table: Airtable.Table<T>
+  constructor(base: InstanceType<typeof Airtable.Base>, id: string, name: string) {
+    this._id = id
+    this._name = name
+    this.table = new Airtable.Table<T>(base, id, name);
+  }
+  async find(id: ID): Promise<T | undefined> {
+    const result = await this.table.find(id)
+    return result && result.fields ? {_id: id, ...result.fields} : undefined;
+  }
+  async select(options?: Airtable.SelectOptions<T>): Promise<T[]> {
+    const result = await this.table.select(options).all()
+    return result.map(r => ({_id: r.id, ...r.fields}))
+  }
+  async create(recordData: string | (Partial<T> & {_id: undefined})): Promise<T> {
+    const result = await this.table.create(recordData)
+    return {_id: result.id as ID, ...result.fields}
+  }
+  async update(recordData: Partial<T> & {_id: ID}): Promise<T> {
+    const {_id, ...fields } = recordData
+    const result = await this.table.update(_id, fields as Partial<T>)
+    return {_id, ...result.fields}
+  }
+  async destroy(id: ID): Promise<T> {
+    const result = await this.table.destroy(id)
+    return {_id: id, ...result.fields}
+  }
+}
+
+export class ${className} {
+  readonly at: Airtable
+  readonly base: InstanceType<typeof Airtable.Base>
+  static readonly _id: string = '${base.id}'
+  static readonly _name: string = '${base.name}'
+  constructor(options: Airtable.AirtableOptions) {
+      this.at = new Airtable(options)
+      this.base = new Airtable.Base(this.at, ${className}._id);
+  }`,'')
+
       tables
         .map((x) => ({ ...x, tname: pascalCase(x.name) }))
-        .forEach(({ tname, id }) =>
-          lines.push(`  get${tname}Table = ()=> this.base('${id}') as Airtable.Table<${tname}>;`),
+        .forEach(
+          ({ tname, id, name }) =>
+            lines.push(`  get${tname}Table = ()=> new TypedTable<${tname}Id, ${tname}>(this.base, '${id}', '${name}');`), //as Airtable.Table<${tname}>;`),
         )
       lines.push('}', '')
     }
